@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Dataset files (intentionally excluded)
+train.csv
+test.csv
+train_ims/
+test_ims/
+
+# Training artifacts / caches
+*.joblib
+*.cbm
+*.npy
+catboost_info/
+
+# Logs
+*.log
