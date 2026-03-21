@@ -25,7 +25,7 @@ from catboost import CatBoostClassifier
 TRAIN_CSV = "train.csv"
 TRAIN_DIR = "train_ims"
 LOG_FILE = "training_log.txt"
-OPTUNA_TRIALS = 50
+OPTUNA_TRIALS = 15  # Reduce from 50 to 15 to save days of compute time
 RANDOM_STATE = 42
 
 
@@ -270,9 +270,17 @@ def main():
     X_tr, X_val, X_te, y_tr, y_val, y_te = load_or_build_features()
     num_class = len(np.unique(y_tr))
 
+    # --- ADD THIS TO PREVENT THE 30-DAY TIME BOMB ---
+    logging.info("Subsampling training data for Optuna to save time...")
+    # Use only 15% of the training data (approx 10,500 samples) for the hyperparameter search
+    X_opt, _, y_opt, _ = train_test_split(
+        X_tr, y_tr, train_size=0.15, random_state=RANDOM_STATE, stratify=y_tr
+    )
+
     logging.info("Starting Optuna hyperparameter search (%d trials) for SVM and XGBoost...", OPTUNA_TRIALS)
     study = optuna.create_study(direction="maximize")
-    study.optimize(lambda trial: objective(trial, X_tr, y_tr, X_val, y_val), n_trials=OPTUNA_TRIALS)
+    # PASS X_opt AND y_opt HERE INSTEAD OF X_tr AND y_tr
+    study.optimize(lambda trial: objective(trial, X_opt, y_opt, X_val, y_val), n_trials=OPTUNA_TRIALS)
     best_params = study.best_params
     logging.info("Best Optuna params: %s", best_params)
     logging.info("Best Optuna validation score: %.4f", study.best_value)
