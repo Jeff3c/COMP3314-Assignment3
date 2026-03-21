@@ -7,3 +7,5 @@ xgboost
 catboost
 joblib
 notebook
+tqdm
+optuna
