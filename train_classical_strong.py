@@ -98,38 +98,49 @@ def process_split(df, augment=False):
 def load_or_build_features():
     cache_train = "X_train_safe.npy"
     cache_train_y = "y_train_safe.npy"
+    cache_val = "X_val_safe.npy"
+    cache_val_y = "y_val_safe.npy"
     cache_test = "X_test_safe.npy"
     cache_test_y = "y_test_safe.npy"
-    if all(os.path.exists(f) for f in [cache_train, cache_train_y, cache_test, cache_test_y]):
+    if all(os.path.exists(f) for f in [cache_train, cache_train_y, cache_val, cache_val_y, cache_test, cache_test_y]):
         X_tr = np.load(cache_train)
         y_tr = np.load(cache_train_y)
+        X_val = np.load(cache_val)
+        y_val = np.load(cache_val_y)
         X_te = np.load(cache_test)
         y_te = np.load(cache_test_y)
-        print(f"Loaded cached safe splits: X_tr={X_tr.shape}, X_te={X_te.shape}")
-        return X_tr, X_te, y_tr, y_te
+        print(f"Loaded cached safe splits: X_tr={X_tr.shape}, X_val={X_val.shape}, X_te={X_te.shape}")
+        return X_tr, X_val, X_te, y_tr, y_val, y_te
 
     df = pd.read_csv(TRAIN_CSV)
-    df_train, df_test = train_test_split(df, test_size=0.2, random_state=42, stratify=df["label"])
+    # First split off test set (20%)
+    df_trainval, df_test = train_test_split(df, test_size=0.2, random_state=42, stratify=df["label"])
+    # Then split trainval into train (70%) and val (10%)
+    rel_val = 0.1 / 0.8  # 10% out of the remaining 80%
+    df_train, df_val = train_test_split(df_trainval, test_size=rel_val, random_state=42, stratify=df_trainval["label"])
+
     print(f"Extracting features for TRAIN set (with augmentation)...")
     X_tr, y_tr = process_split(df_train, augment=True)
+    print(f"Extracting features for VALIDATION set (no augmentation)...")
+    X_val, y_val = process_split(df_val, augment=False)
     print(f"Extracting features for TEST set (no augmentation)...")
     X_te, y_te = process_split(df_test, augment=False)
+
     np.save(cache_train, X_tr)
     np.save(cache_train_y, y_tr)
+    np.save(cache_val, X_val)
+    np.save(cache_val_y, y_val)
     np.save(cache_test, X_te)
     np.save(cache_test_y, y_te)
-    print(f"Saved safe split feature caches: X_tr={X_tr.shape}, X_te={X_te.shape}")
-    return X_tr, X_te, y_tr, y_te
+    print(f"Saved safe split feature caches: X_tr={X_tr.shape}, X_val={X_val.shape}, X_te={X_te.shape}")
+    return X_tr, X_val, X_te, y_tr, y_val, y_te
 
 
 
 def main():
-    X_tr, X_te, y_tr, y_te = load_or_build_features()
 
-    # Validation split for blend weights
-    X_fit, X_val, y_fit, y_val = train_test_split(
-        X_tr, y_tr, test_size=0.2, random_state=42, stratify=y_tr
-    )
+    # Load new splits: X_tr (augmented), X_val (not augmented), X_te (not augmented)
+    X_tr, X_val, X_te, y_tr, y_val, y_te = load_or_build_features()
 
     print("Training calibrated RBF-SVM...")
     svm_base = SVC(C=8, gamma="scale", kernel="rbf", decision_function_shape="ovr", probability=False)
@@ -140,7 +151,7 @@ def main():
             ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
         ]
     )
-    svm.fit(X_fit, y_fit)
+    svm.fit(X_tr, y_tr)
     svm_val_proba = svm.predict_proba(X_val)
     svm_val_pred = np.argmax(svm_val_proba, axis=1)
     svm_val_acc = accuracy_score(y_val, svm_val_pred)
@@ -153,7 +164,7 @@ def main():
             ("pca", PCA(n_components=320, random_state=42)),
         ]
     )
-    X_fit_xgb = xgb_pre.fit_transform(X_fit)
+    X_tr_xgb = xgb_pre.fit_transform(X_tr)
     X_val_xgb = xgb_pre.transform(X_val)
 
     xgb = XGBClassifier(
@@ -173,7 +184,7 @@ def main():
         random_state=42,
         n_jobs=-1,
     )
-    xgb.fit(X_fit_xgb, y_fit, eval_set=[(X_val_xgb, y_val)], verbose=False)
+    xgb.fit(X_tr_xgb, y_tr, eval_set=[(X_val_xgb, y_val)], verbose=False)
     xgb_val_proba = xgb.predict_proba(X_val_xgb)
     xgb_val_pred = np.argmax(xgb_val_proba, axis=1)
     xgb_val_acc = accuracy_score(y_val, xgb_val_pred)
@@ -192,14 +203,20 @@ def main():
             best_w = (w_svm, w_xgb)
     print(f"Best validation blend: svm={best_w[0]:.2f}, xgb={best_w[1]:.2f}, acc={best_val:.4f}")
 
-    # Refit on all train data
-    print("Refitting SVM and XGBoost on all training data...")
-    svm.fit(X_tr, y_tr)
+
+    # Combine train and validation for final training
+    print("Refitting SVM and XGBoost on all training data (train + val)...")
+    X_final_tr = np.vstack([X_tr, X_val])
+    y_final_tr = np.concatenate([y_tr, y_val])
+
+    svm.fit(X_final_tr, y_final_tr)
     svm_proba = svm.predict_proba(X_te)
 
-    X_tr_xgb = xgb_pre.fit_transform(X_tr)
+    X_final_tr_xgb = xgb_pre.fit_transform(X_final_tr)
+    X_val_xgb = xgb_pre.transform(X_val)
     X_te_xgb = xgb_pre.transform(X_te)
-    xgb.fit(X_tr_xgb, y_tr, eval_set=[(X_te_xgb, y_te)], verbose=False)
+    # Use the validation set for monitoring, not the test set
+    xgb.fit(X_final_tr_xgb, y_final_tr, eval_set=[(X_val_xgb, y_val)], verbose=False)
     xgb_proba = xgb.predict_proba(X_te_xgb)
 
     print("Manual weighted blend on test set...")
