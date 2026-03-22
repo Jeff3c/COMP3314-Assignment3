@@ -203,8 +203,7 @@ def build_xgb(num_class: int, max_depth: int, learning_rate: float, n_estimators
         colsample_bytree=0.95,
         reg_lambda=1.5,
         reg_alpha=0.1,
-        tree_method="hist",
-        device="cuda",
+        tree_method="gpu_hist",
         objective="multi:softprob",
         num_class=num_class,
         eval_metric="mlogloss",
@@ -255,6 +254,10 @@ def objective(trial, X_tr, y_tr, X_val, y_val):
         learning_rate=xgb_learning_rate,
         n_estimators=220,
     )
+    # Convert to DMatrix for GPU
+    import xgboost as xgb
+    dtrain = xgb.DMatrix(X_tr_xgb, label=y_tr, enable_categorical=False, nthread=-1)
+    dval = xgb.DMatrix(X_val_xgb, label=y_val, enable_categorical=False, nthread=-1)
     xgb_model.fit(X_tr_xgb, y_tr, eval_set=[(X_val_xgb, y_val)], verbose=False)
     xgb_val_proba = xgb_model.predict_proba(X_val_xgb)
 
@@ -268,24 +271,181 @@ def main():
 
     logging.info("Loading train/validation/test feature splits...")
     X_tr, X_val, X_te, y_tr, y_val, y_te = load_or_build_features()
-    num_class = len(np.unique(y_tr))
+    # Merge train and val for OOF stacking
+    X_train_full = np.vstack([X_tr, X_val])
+    y_train_full = np.concatenate([y_tr, y_val])
+    num_class = len(np.unique(y_train_full))
 
-    # --- ADD THIS TO PREVENT THE 30-DAY TIME BOMB ---
-    logging.info("Subsampling training data for Optuna to save time...")
-    # Use only 15% of the training data (approx 10,500 samples) for the hyperparameter search
-    X_opt, _, y_opt, _ = train_test_split(
-        X_tr, y_tr, train_size=0.15, random_state=RANDOM_STATE, stratify=y_tr
-    )
+    # Optuna: 15% subsample, 3-fold CV
+    from sklearn.model_selection import StratifiedKFold
+    def optuna_objective(trial):
+        svm_c = trial.suggest_float("svm_C", 0.1, 100.0, log=True)
+        svm_gamma = trial.suggest_float("svm_gamma", 1e-4, 1.0, log=True)
+        xgb_max_depth = trial.suggest_int("xgb_max_depth", 3, 10)
+        xgb_learning_rate = trial.suggest_float("xgb_learning_rate", 0.01, 0.3, log=True)
+        # Subsample
+        X_sub, _, y_sub, _ = train_test_split(
+            X_train_full, y_train_full, train_size=0.15, random_state=RANDOM_STATE, stratify=y_train_full
+        )
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+        accs = []
+        for train_idx, val_idx in skf.split(X_sub, y_sub):
+            X_tr_o, X_val_o = X_sub[train_idx], X_sub[val_idx]
+            y_tr_o, y_val_o = y_sub[train_idx], y_sub[val_idx]
+            # SVM
+            svm_base = SVC(
+                C=svm_c,
+                gamma=svm_gamma,
+                kernel="rbf",
+                decision_function_shape="ovr",
+                probability=False,
+                verbose=False,
+                random_state=RANDOM_STATE,
+            )
+            svm_model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
+                ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
+            ])
+            svm_model.fit(X_tr_o, y_tr_o)
+            svm_val_proba = svm_model.predict_proba(X_val_o)
+            # XGB
+            xgb_pre = Pipeline([
+                ("scaler", StandardScaler()),
+                ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
+            ])
+            X_tr_xgb = xgb_pre.fit_transform(X_tr_o)
+            X_val_xgb = xgb_pre.transform(X_val_o)
+            xgb_model = build_xgb(
+                num_class=len(np.unique(y_tr_o)),
+                max_depth=xgb_max_depth,
+                learning_rate=xgb_learning_rate,
+                n_estimators=220,
+            )
+            xgb_model.fit(X_tr_xgb, y_tr_o, eval_set=[(X_val_xgb, y_val_o)], verbose=False)
+            xgb_val_proba = xgb_model.predict_proba(X_val_xgb)
+            # Blend
+            blended_val = 0.5 * svm_val_proba + 0.5 * xgb_val_proba
+            y_pred = np.argmax(blended_val, axis=1)
+            accs.append(accuracy_score(y_val_o, y_pred))
+        return np.mean(accs)
 
-    logging.info("Starting Optuna hyperparameter search (%d trials) for SVM and XGBoost...", OPTUNA_TRIALS)
+    logging.info("Starting Optuna hyperparameter search (%d trials, 3-fold CV, 15%% subsample)...", OPTUNA_TRIALS)
     study = optuna.create_study(direction="maximize")
-    # PASS X_opt AND y_opt HERE INSTEAD OF X_tr AND y_tr
-    study.optimize(lambda trial: objective(trial, X_opt, y_opt, X_val, y_val), n_trials=OPTUNA_TRIALS)
+    study.optimize(optuna_objective, n_trials=OPTUNA_TRIALS)
     best_params = study.best_params
     logging.info("Best Optuna params: %s", best_params)
-    logging.info("Best Optuna validation score: %.4f", study.best_value)
+    logging.info("Best Optuna CV score: %.4f", study.best_value)
 
-    logging.info("Training calibrated RBF-SVM...")
+    # OOF stacking
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    n_train = X_train_full.shape[0]
+    n_test = X_te.shape[0]
+    # Pre-allocate OOF and test meta-features
+    oof_svm = np.zeros((n_train, num_class))
+    oof_rf = np.zeros((n_train, num_class))
+    oof_knn = np.zeros((n_train, num_class))
+    oof_xgb = np.zeros((n_train, num_class))
+    oof_cat = np.zeros((n_train, num_class))
+    # For test set, average predictions from each fold
+    test_svm = np.zeros((n_test, num_class, 5))
+    test_rf = np.zeros((n_test, num_class, 5))
+    test_knn = np.zeros((n_test, num_class, 5))
+    test_xgb = np.zeros((n_test, num_class, 5))
+    test_cat = np.zeros((n_test, num_class, 5))
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_full, y_train_full)):
+        logging.info(f"OOF fold {fold+1}/5...")
+        X_tr_o, X_val_o = X_train_full[train_idx], X_train_full[val_idx]
+        y_tr_o, y_val_o = y_train_full[train_idx], y_train_full[val_idx]
+        # SVM
+        svm_base = SVC(
+            C=best_params["svm_C"],
+            gamma=best_params["svm_gamma"],
+            kernel="rbf",
+            decision_function_shape="ovr",
+            probability=False,
+            verbose=False,
+            random_state=RANDOM_STATE,
+        )
+        svm = Pipeline([
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
+            ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
+        ])
+        svm.fit(X_tr_o, y_tr_o)
+        oof_svm[val_idx] = svm.predict_proba(X_val_o)
+        test_svm[:, :, fold] = svm.predict_proba(X_te)
+        # RF
+        rf = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            verbose=0,
+        )
+        rf.fit(X_tr_o, y_tr_o)
+        oof_rf[val_idx] = rf.predict_proba(X_val_o)
+        test_rf[:, :, fold] = rf.predict_proba(X_te)
+        # KNN
+        knn = Pipeline([
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=50, random_state=RANDOM_STATE)),
+            ("knn", KNeighborsClassifier(n_neighbors=15, n_jobs=-1)),
+        ])
+        knn.fit(X_tr_o, y_tr_o)
+        oof_knn[val_idx] = knn.predict_proba(X_val_o)
+        test_knn[:, :, fold] = knn.predict_proba(X_te)
+        # XGB
+        xgb_pre = Pipeline([
+            ("scaler", StandardScaler()),
+            ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
+        ])
+        X_tr_xgb = xgb_pre.fit_transform(X_tr_o)
+        X_val_xgb = xgb_pre.transform(X_val_o)
+        X_te_xgb = xgb_pre.transform(X_te)
+        xgb = build_xgb(
+            num_class=num_class,
+            max_depth=best_params["xgb_max_depth"],
+            learning_rate=best_params["xgb_learning_rate"],
+            n_estimators=520,
+        )
+        xgb.fit(X_tr_xgb, y_tr_o, eval_set=[(X_val_xgb, y_val_o)], verbose=0)
+        oof_xgb[val_idx] = xgb.predict_proba(X_val_xgb)
+        test_xgb[:, :, fold] = xgb.predict_proba(X_te_xgb)
+        # CatBoost
+        catboost = CatBoostClassifier(
+            iterations=600,
+            depth=8,
+            learning_rate=0.05,
+            loss_function="MultiClass",
+            eval_metric="MultiClass",
+            random_seed=RANDOM_STATE,
+            task_type="GPU",
+            verbose=0,
+        )
+        catboost.fit(X_tr_o, y_tr_o, eval_set=(X_val_o, y_val_o))
+        oof_cat[val_idx] = catboost.predict_proba(X_val_o)
+        test_cat[:, :, fold] = catboost.predict_proba(X_te)
+
+    # Average test meta-features across folds
+    test_svm_mean = np.mean(test_svm, axis=2)
+    test_rf_mean = np.mean(test_rf, axis=2)
+    test_knn_mean = np.mean(test_knn, axis=2)
+    test_xgb_mean = np.mean(test_xgb, axis=2)
+    test_cat_mean = np.mean(test_cat, axis=2)
+
+    # Train meta-learner
+    X_meta_train = np.hstack([oof_svm, oof_xgb, oof_rf, oof_cat, oof_knn])
+    X_meta_test = np.hstack([test_svm_mean, test_xgb_mean, test_rf_mean, test_cat_mean, test_knn_mean])
+    meta_learner = LogisticRegression(max_iter=3000, random_state=RANDOM_STATE)
+    meta_learner.fit(X_meta_train, y_train_full)
+
+    # Refit all base models on full train
+    logging.info("Refitting all base models on full training set...")
+    # SVM
     svm_base = SVC(
         C=best_params["svm_C"],
         gamma=best_params["svm_gamma"],
@@ -295,19 +455,13 @@ def main():
         verbose=2,
         random_state=RANDOM_STATE,
     )
-    svm = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-            ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
-        ],
-        verbose=True,
-    )
-    svm.fit(X_tr, y_tr)
-    svm_val_proba = svm.predict_proba(X_val)
-    logging.info("SVM validation accuracy: %.4f", accuracy_score(y_val, np.argmax(svm_val_proba, axis=1)))
-
-    logging.info("Training RandomForest...")
+    svm = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
+        ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
+    ])
+    svm.fit(X_train_full, y_train_full)
+    # RF
     rf = RandomForestClassifier(
         n_estimators=500,
         max_depth=None,
@@ -317,46 +471,29 @@ def main():
         n_jobs=-1,
         verbose=2,
     )
-    rf.fit(X_tr, y_tr)
-    rf_val_proba = rf.predict_proba(X_val)
-    logging.info("RF validation accuracy: %.4f", accuracy_score(y_val, np.argmax(rf_val_proba, axis=1)))
-
-    logging.info("Training KNN pipeline...")
-    knn = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=50, random_state=RANDOM_STATE)),
-            ("knn", KNeighborsClassifier(n_neighbors=15, n_jobs=-1)),
-        ],
-        verbose=True,
-    )
-    knn.fit(X_tr, y_tr)
-    knn_val_proba = knn.predict_proba(X_val)
-    logging.info("KNN validation accuracy: %.4f", accuracy_score(y_val, np.argmax(knn_val_proba, axis=1)))
-
-    logging.info("Training XGBoost on PCA-denoised features (GPU)...")
-    xgb_pre = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
-        ],
-        verbose=True,
-    )
-    X_tr_xgb = xgb_pre.fit_transform(X_tr)
-    X_val_xgb = xgb_pre.transform(X_val)
+    rf.fit(X_train_full, y_train_full)
+    # KNN
+    knn = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=50, random_state=RANDOM_STATE)),
+        ("knn", KNeighborsClassifier(n_neighbors=15, n_jobs=-1)),
+    ])
+    knn.fit(X_train_full, y_train_full)
+    # XGB
+    xgb_pre = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
+    ])
+    X_train_xgb = xgb_pre.fit_transform(X_train_full)
     X_te_xgb = xgb_pre.transform(X_te)
-
     xgb = build_xgb(
         num_class=num_class,
         max_depth=best_params["xgb_max_depth"],
         learning_rate=best_params["xgb_learning_rate"],
         n_estimators=520,
     )
-    xgb.fit(X_tr_xgb, y_tr, eval_set=[(X_val_xgb, y_val)], verbose=10)
-    xgb_val_proba = xgb.predict_proba(X_val_xgb)
-    logging.info("XGBoost validation accuracy: %.4f", accuracy_score(y_val, np.argmax(xgb_val_proba, axis=1)))
-
-    logging.info("Training CatBoost (GPU)...")
+    xgb.fit(X_train_xgb, y_train_full, verbose=10)
+    # CatBoost
     catboost = CatBoostClassifier(
         iterations=600,
         depth=8,
@@ -367,23 +504,9 @@ def main():
         task_type="GPU",
         verbose=10,
     )
-    catboost.fit(X_tr, y_tr, eval_set=(X_val, y_val))
-    cat_val_proba = catboost.predict_proba(X_val)
-    logging.info("CatBoost validation accuracy: %.4f", accuracy_score(y_val, np.argmax(cat_val_proba, axis=1)))
+    catboost.fit(X_train_full, y_train_full)
 
-    logging.info("Training LogisticRegression meta-learner on validation meta-features...")
-    X_meta_val = np.hstack([svm_val_proba, xgb_val_proba, rf_val_proba, cat_val_proba, knn_val_proba])
-    meta_learner = LogisticRegression(max_iter=3000, random_state=RANDOM_STATE)
-    meta_learner.fit(X_meta_val, y_val)
-
-    logging.info("Generating test meta-features and predicting final classes...")
-    svm_proba = svm.predict_proba(X_te)
-    xgb_proba = xgb.predict_proba(X_te_xgb)
-    rf_proba = rf.predict_proba(X_te)
-    cat_proba = catboost.predict_proba(X_te)
-    knn_proba = knn.predict_proba(X_te)
-
-    X_meta_test = np.hstack([svm_proba, xgb_proba, rf_proba, cat_proba, knn_proba])
+    # Final test prediction
     y_pred = meta_learner.predict(X_meta_test)
     acc = accuracy_score(y_te, y_pred)
     logging.info("=" * 60)

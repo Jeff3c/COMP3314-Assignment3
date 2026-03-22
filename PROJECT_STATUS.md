@@ -24,8 +24,8 @@ Last updated: 2026-03-21
 - Final model is saved as classical_strong_ensemble.joblib and includes all base models and the meta-learner.
 
 ## March 2026 Major Pipeline Update
-- Pipeline now uses a 5-base-model ensemble (SVM, XGBoost, RandomForest, CatBoost, KNN) with LogisticRegression meta-learner.
-- Optuna hyperparameter tuning (15 trials, 15% subsample) for SVM and XGBoost.
+- Pipeline now uses Out-Of-Fold (OOF) stacking with 5-fold StratifiedKFold. Five base models (SVM, XGBoost, RandomForest, CatBoost, KNN) generate OOF meta-features for a LogisticRegression meta-learner. All base models are refit on the full training set before test prediction.
+- Optuna hyperparameter tuning (15 trials, 15% subsample, 3-fold CV) for SVM and XGBoost.
 - Feature extraction now includes Gabor filter features (mean/std for 4 orientations).
 - tqdm progress bars for all feature extraction.
 - All logs and progress are saved to training_log.txt for remote monitoring.
