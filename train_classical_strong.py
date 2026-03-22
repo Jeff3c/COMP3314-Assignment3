@@ -1,7 +1,9 @@
+
 import logging
 import os
 import sys
 import time
+import gc
 
 import cv2
 import numpy as np
@@ -200,10 +202,12 @@ def gabor_features(gray: np.ndarray) -> np.ndarray:
 
 
 def extract_features(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Denoising: Apply 3x3 median blur to input image before feature extraction
+    img_denoised = cv2.medianBlur(img, 3)
+    gray = cv2.cvtColor(img_denoised, cv2.COLOR_BGR2GRAY)
     f_hog = hog_features(gray)
     f_lbp = lbp_features(gray)
-    f_hist = color_hist_features(img, bins=16)
+    f_hist = color_hist_features(img_denoised, bins=16)
     f_gabor = gabor_features(gray)
     raw_small = (
         cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA)
@@ -343,6 +347,7 @@ def build_tree_selector() -> SelectFromModel:
 
 
 def build_base_estimators(num_class: int):
+    # ... (Keep SVM pipeline exactly as it is) ...
     svm_pipeline = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -362,13 +367,16 @@ def build_base_estimators(num_class: int):
         ]
     )
 
+    # 1. Constrain the Random Forest
     rf = RandomForestClassifier(
-        n_estimators=600,
+        n_estimators=400,          # Reduced from 600
+        max_depth=20,              # Limit tree depth to save massive RAM
         random_state=RANDOM_STATE,
-        n_jobs=-1,
+        n_jobs=2,                  # Only use 2 cores internally, not all of them
         class_weight="balanced_subsample",
     )
 
+    # ... (Keep KNN, XGB, CAT, LGBM pipelines exactly as they are) ...
     knn_pipeline = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -454,13 +462,15 @@ def build_base_estimators(num_class: int):
         ]
     )
 
+    # 2. Prevent CalibratedClassifierCV from copying data across all CPU cores
+    # Set n_jobs=1 or n_jobs=2 max for the wrappers.
     return {
-        "svm": CalibratedClassifierCV(svm_pipeline, method="sigmoid", cv=3, n_jobs=-1),
-        "rf": CalibratedClassifierCV(rf, method="sigmoid", cv=3, n_jobs=-1),
-        "knn": CalibratedClassifierCV(knn_pipeline, method="sigmoid", cv=3, n_jobs=-1),
-        "xgb": CalibratedClassifierCV(xgb_pipeline, method="sigmoid", cv=3, n_jobs=-1),
-        "cat": CalibratedClassifierCV(cat_pipeline, method="sigmoid", cv=3, n_jobs=-1),
-        "lgbm": CalibratedClassifierCV(lgbm_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+        "svm": CalibratedClassifierCV(svm_pipeline, method="sigmoid", cv=3, n_jobs=2),
+        "rf": CalibratedClassifierCV(rf, method="sigmoid", cv=3, n_jobs=1),
+        "knn": CalibratedClassifierCV(knn_pipeline, method="sigmoid", cv=3, n_jobs=1),
+        "xgb": CalibratedClassifierCV(xgb_pipeline, method="sigmoid", cv=3, n_jobs=1),
+        "cat": CalibratedClassifierCV(cat_pipeline, method="sigmoid", cv=3, n_jobs=1),
+        "lgbm": CalibratedClassifierCV(lgbm_pipeline, method="sigmoid", cv=3, n_jobs=1),
     }
 
 
@@ -497,6 +507,7 @@ def main():
 
         estimators = build_base_estimators(num_class=num_class)
 
+
         for name in model_names:
             logging.info("Fold %d | Training calibrated %s", fold_idx, name.upper())
             model = estimators[name]
@@ -512,6 +523,9 @@ def main():
             fold_acc = accuracy_score(y_fold_valid, np.argmax(valid_proba, axis=1))
             logging.info("Fold %d | %s validation accuracy: %.4f", fold_idx, name.upper(), fold_acc)
 
+            # --- ADD THIS LINE TO CLEAR RAM ---
+            gc.collect()
+
         fold_elapsed = time.time() - fold_start_time
         print(f"Fold {fold_idx}/{N_SPLITS} elapsed time: {fold_elapsed:.2f} seconds")
 
@@ -521,7 +535,12 @@ def main():
         np.mean(tta_test_preds[name], axis=2) for name in model_names
     ])
 
+
+    # Regularized meta-learner to prevent overfitting
     meta_learner = LogisticRegression(
+        penalty='l1',
+        solver='liblinear',
+        C=1.0,
         max_iter=4000,
         random_state=RANDOM_STATE,
         multi_class="auto",

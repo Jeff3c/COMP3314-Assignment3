@@ -8,9 +8,11 @@ Last updated: 2026-03-21
 - Main training script: train_classical_strong.py
 
 
+
 ## What Is Done
 - Leakage fix: train/test split is done on dataframe rows before augmentation.
 - Augmentation policy: horizontal flip is applied only to train split.
+- Denoising: 3x3 median blur is applied to all images before feature extraction.
 - Safe feature caches are implemented (current):
   - X_train_safe_gabor_v2.npy
   - y_train_safe_gabor_v2.npy
@@ -20,7 +22,7 @@ Last updated: 2026-03-21
   - y_test_safe_gabor_v2.npy
   - test_split_names_safe_gabor_v2.npy (optional)
 - Final prediction now uses a 5-fold OOF stacked ensemble with calibrated base probabilities.
-- Meta-learner is LogisticRegression trained on OOF meta-features.
+- Meta-learner is now a regularized LogisticRegression (L1 penalty, liblinear solver) trained on OOF meta-features.
 
 
 ## Current Risks / Notes

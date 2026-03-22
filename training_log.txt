@@ -1,0 +1,29 @@
+2026-03-22 18:07:32,592 | INFO | Logging initialized. Writing terminal output to training_log.txt
+2026-03-22 18:07:32,593 | INFO | Loading train/validation/test feature splits...
+2026-03-22 18:07:34,216 | INFO | Loaded cached safe splits: X_tr=(70000, 2956), X_val=(5000, 2956), X_te=(10000, 2956)
+2026-03-22 18:07:34,216 | INFO | Merging train and validation for OOF stacking...
+2026-03-22 18:07:34,549 | INFO | Preparing flipped test features for TTA...
+2026-03-22 18:08:04,542 | INFO | Starting OOF fold 1/5
+2026-03-22 18:08:04,940 | INFO | Fold 1 | Training calibrated SVM
+Traceback (most recent call last):
+  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 570, in <module>
+    main()
+  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 512, in main
+    model.fit(X_fold_train, y_fold_train)
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\base.py", line 1336, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\calibration.py", line 438, in fit
+    self.calibrated_classifiers_ = parallel(
+                                   ^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\utils\parallel.py", line 91, in __call__
+    return super().__call__(iterable_with_config_and_warning_filters)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 2072, in __call__
+    return output if self.return_generator else list(output)
+                                                ^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1682, in _get_outputs
+    yield from self._retrieve()
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1800, in _retrieve
+    time.sleep(0.01)
+KeyboardInterrupt

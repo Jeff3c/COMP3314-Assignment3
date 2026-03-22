@@ -63,13 +63,15 @@ Legacy/obsolete outputs (safe to delete):
 - XGBoost GPU mode requires a valid local CUDA setup.
 - If GPU is unavailable, adjust the script to CPU mode as needed.
 
+
 ## Major Pipeline Updates (March 2026)
 
 - **5-Fold OOF Stacking (v2)**: The main pipeline merges train + validation, then runs StratifiedKFold(n_splits=5) to generate OOF probabilities.
 - **Six Calibrated Base Models**: SVM, RandomForest, KNN, XGBoost, CatBoost, and LightGBM are all wrapped in `CalibratedClassifierCV(method="sigmoid", cv=3)`.
 - **Tree Feature Selection**: XGBoost, CatBoost, and LightGBM use `SelectFromModel(RandomForestClassifier)` to keep the top 1,000 features instead of PCA.
 - **Early Stopping**: All boosting models use an early-stopping strategy with 50 rounds.
-- **Meta-Learner**: A LogisticRegression model is trained on stacked OOF probabilities.
+- **Denoising**: All feature extraction now applies a 3x3 median blur to each image before any other processing (see extract_features).
+- **Meta-Learner Regularization**: The meta-learner is now a regularized LogisticRegression (L1 penalty, liblinear solver) to prevent overfitting.
 - **TTA on Test Split**: For each image in the holdout test split, probabilities from the original and horizontally flipped images are averaged before meta prediction.
 - **No Neural Networks**: The pipeline only uses handcrafted features and classical ML models.
 
