@@ -1,32 +1,38 @@
+import logging
 import os
 import sys
-import logging
+import time
+
 import cv2
 import numpy as np
 import pandas as pd
-import optuna
+from catboost import CatBoostClassifier
 from joblib import dump
-from tqdm import tqdm
+from lightgbm import LGBMClassifier
 from skimage.feature import hog, local_binary_pattern
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.svm import SVC
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.feature_selection import SelectFromModel
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from tqdm import tqdm
 from xgboost import XGBClassifier
-from catboost import CatBoostClassifier
 
 
 TRAIN_CSV = "train.csv"
 TRAIN_DIR = "train_ims"
 LOG_FILE = "training_log.txt"
-OPTUNA_TRIALS = 30  # Increased for more robust search
 RANDOM_STATE = 42
+N_SPLITS = 5
+EARLY_STOPPING_ROUNDS = 50
+TOP_TREE_FEATURES = 1000
 
 
 class TeeStream:
@@ -45,6 +51,78 @@ class TeeStream:
             stream.flush()
 
 
+class EarlyStoppingBoostingClassifier(BaseEstimator, ClassifierMixin):
+    """Fit boosting models with an internal validation split for early stopping."""
+
+    def __init__(self, model_name: str, model_params: dict, random_state: int = RANDOM_STATE):
+        self.model_name = model_name
+        self.model_params = model_params
+        self.random_state = random_state
+
+    def _build_model(self):
+        if self.model_name == "xgb":
+            return XGBClassifier(**self.model_params)
+        if self.model_name == "cat":
+            return CatBoostClassifier(**self.model_params)
+        if self.model_name == "lgbm":
+            return LGBMClassifier(**self.model_params)
+        raise ValueError(f"Unsupported boosting model: {self.model_name}")
+
+    def fit(self, X, y):
+        start_time = time.time()
+        
+        X_fit, X_eval, y_fit, y_eval = train_test_split(
+            X,
+            y,
+            test_size=0.15,
+            stratify=y,
+            random_state=self.random_state,
+        )
+        self.model_ = self._build_model()
+        self.classes_ = np.unique(y)
+
+        if self.model_name == "xgb":
+            self.model_.fit(
+                X_fit,
+                y_fit,
+                eval_set=[(X_eval, y_eval)],
+                verbose=False,
+            )
+        elif self.model_name == "cat":
+            self.model_.fit(
+                X_fit,
+                y_fit,
+                eval_set=(X_eval, y_eval),
+                use_best_model=True,
+                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+                verbose=False,
+            )
+        elif self.model_name == "lgbm":
+            from lightgbm import early_stopping, log_evaluation
+            eval_set = [(X_eval, y_eval)]
+            callbacks = [
+                early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS),
+                log_evaluation(period=0),  # Keep console output quiet like XGB/CatBoost wrappers
+            ]
+            self.model_.fit(
+                X_fit,
+                y_fit,
+                eval_set=eval_set,
+                eval_metric="multi_logloss",
+                callbacks=callbacks,
+            )
+        
+        elapsed = time.time() - start_time
+        print(f"  >>> {self.model_name.upper()} training took {elapsed:.2f} seconds.")
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(X)
+
+    def predict_proba(self, X):
+        return self.model_.predict_proba(X)
+
+
 def setup_logging():
     log_file_stream = open(LOG_FILE, "w", buffering=1, encoding="utf-8")
     tee_stream = TeeStream(sys.__stdout__, log_file_stream)
@@ -60,14 +138,13 @@ def setup_logging():
 
 
 def color_hist_features(img_bgr: np.ndarray, bins: int = 16) -> np.ndarray:
-    # Convert to HSV
     img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     h, w = img_hsv.shape[:2]
     hs, ws = h // 4, w // 4
     feats = []
     for i in range(4):
         for j in range(4):
-            q = img_hsv[i*hs:(i+1)*hs, j*ws:(j+1)*ws]
+            q = img_hsv[i * hs : (i + 1) * hs, j * ws : (j + 1) * ws]
             chans = cv2.split(q)
             for ch in chans:
                 hist = cv2.calcHist([ch], [0], None, [bins], [0, 256]).ravel()
@@ -82,11 +159,11 @@ def lbp_features(gray: np.ndarray) -> np.ndarray:
     feats = []
     for i in range(4):
         for j in range(4):
-            q = gray[i*hs:(i+1)*hs, j*ws:(j+1)*ws]
+            q = gray[i * hs : (i + 1) * hs, j * ws : (j + 1) * ws]
             lbp = local_binary_pattern(q, P=8, R=1, method="uniform")
             hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, 11), range=(0, 10))
             hist = hist.astype(np.float32)
-            hist /= (hist.sum() + 1e-9)
+            hist /= hist.sum() + 1e-9
             feats.append(hist)
     return np.concatenate(feats)
 
@@ -128,11 +205,16 @@ def extract_features(img: np.ndarray) -> np.ndarray:
     f_lbp = lbp_features(gray)
     f_hist = color_hist_features(img, bins=16)
     f_gabor = gabor_features(gray)
-    raw_small = cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32).ravel() / 255.0
+    raw_small = (
+        cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA)
+        .astype(np.float32)
+        .ravel()
+        / 255.0
+    )
     return np.concatenate([f_hog, f_lbp, f_hist, f_gabor, raw_small]).astype(np.float32)
 
 
-def process_split(df, augment=False):
+def process_split(df: pd.DataFrame, augment: bool = False):
     X_list = []
     y_list = []
     desc = "Feature extraction (augmented)" if augment else "Feature extraction"
@@ -151,6 +233,18 @@ def process_split(df, augment=False):
     y = np.array(y_list, dtype=np.int64)
     return X, y
 
+
+def build_flipped_features(im_names: np.ndarray) -> np.ndarray:
+    X_flip = []
+    for im_name in tqdm(im_names, total=len(im_names), desc="Building flip features", file=sys.__stdout__):
+        p = os.path.join(TRAIN_DIR, str(im_name))
+        img = cv2.imread(p)
+        if img is None:
+            raise ValueError(f"Failed to read image: {p}")
+        X_flip.append(extract_features(cv2.flip(img, 1)))
+    return np.vstack(X_flip)
+
+
 def load_or_build_features():
     cache_train = "X_train_safe_gabor_v2.npy"
     cache_train_y = "y_train_safe_gabor_v2.npy"
@@ -158,22 +252,56 @@ def load_or_build_features():
     cache_val_y = "y_val_safe_gabor_v2.npy"
     cache_test = "X_test_safe_gabor_v2.npy"
     cache_test_y = "y_test_safe_gabor_v2.npy"
-    if all(os.path.exists(f) for f in [cache_train, cache_train_y, cache_val, cache_val_y, cache_test, cache_test_y]):
+    cache_test_names = "test_split_names_safe_gabor_v2.npy"
+
+    has_main_caches = all(
+        os.path.exists(f)
+        for f in [cache_train, cache_train_y, cache_val, cache_val_y, cache_test, cache_test_y]
+    )
+
+    if has_main_caches:
         X_tr = np.load(cache_train)
         y_tr = np.load(cache_train_y)
         X_val = np.load(cache_val)
         y_val = np.load(cache_val_y)
         X_te = np.load(cache_test)
         y_te = np.load(cache_test_y)
-        logging.info("Loaded cached safe splits: X_tr=%s, X_val=%s, X_te=%s", X_tr.shape, X_val.shape, X_te.shape)
-        return X_tr, X_val, X_te, y_tr, y_val, y_te
+
+        if os.path.exists(cache_test_names):
+            test_names = np.load(cache_test_names, allow_pickle=True)
+        else:
+            df = pd.read_csv(TRAIN_CSV)
+            _, df_test = train_test_split(
+                df,
+                test_size=0.2,
+                random_state=RANDOM_STATE,
+                stratify=df["label"],
+            )
+            test_names = df_test["im_name"].to_numpy()
+            np.save(cache_test_names, test_names)
+
+        logging.info(
+            "Loaded cached safe splits: X_tr=%s, X_val=%s, X_te=%s",
+            X_tr.shape,
+            X_val.shape,
+            X_te.shape,
+        )
+        return X_tr, X_val, X_te, y_tr, y_val, y_te, test_names
 
     df = pd.read_csv(TRAIN_CSV)
-    # First split off test set (20%)
-    df_trainval, df_test = train_test_split(df, test_size=0.2, random_state=RANDOM_STATE, stratify=df["label"])
-    # Then split trainval into train (70%) and val (10%)
-    rel_val = 0.1 / 0.8  # 10% out of the remaining 80%
-    df_train, df_val = train_test_split(df_trainval, test_size=rel_val, random_state=RANDOM_STATE, stratify=df_trainval["label"])
+    df_trainval, df_test = train_test_split(
+        df,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=df["label"],
+    )
+    rel_val = 0.1 / 0.8
+    df_train, df_val = train_test_split(
+        df_trainval,
+        test_size=rel_val,
+        random_state=RANDOM_STATE,
+        stratify=df_trainval["label"],
+    )
 
     logging.info("Extracting features for TRAIN set (with augmentation)...")
     X_tr, y_tr = process_split(df_train, augment=True)
@@ -181,6 +309,7 @@ def load_or_build_features():
     X_val, y_val = process_split(df_val, augment=False)
     logging.info("Extracting features for TEST set (no augmentation)...")
     X_te, y_te = process_split(df_test, augment=False)
+    test_names = df_test["im_name"].to_numpy()
 
     np.save(cache_train, X_tr)
     np.save(cache_train_y, y_tr)
@@ -188,367 +317,241 @@ def load_or_build_features():
     np.save(cache_val_y, y_val)
     np.save(cache_test, X_te)
     np.save(cache_test_y, y_te)
-    logging.info("Saved safe split feature caches: X_tr=%s, X_val=%s, X_te=%s", X_tr.shape, X_val.shape, X_te.shape)
-    return X_tr, X_val, X_te, y_tr, y_val, y_te
+    np.save(cache_test_names, test_names)
+
+    logging.info(
+        "Saved safe split feature caches: X_tr=%s, X_val=%s, X_te=%s",
+        X_tr.shape,
+        X_val.shape,
+        X_te.shape,
+    )
+    return X_tr, X_val, X_te, y_tr, y_val, y_te, test_names
 
 
-
-def build_xgb(num_class: int, max_depth: int, learning_rate: float, n_estimators: int = 520):
-    return XGBClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        min_child_weight=3,
-        subsample=0.95,
-        colsample_bytree=0.95,
-        reg_lambda=1.5,
-        reg_alpha=0.1,
-        tree_method="gpu_hist",
-        objective="multi:softprob",
-        num_class=num_class,
-        eval_metric="mlogloss",
+def build_tree_selector() -> SelectFromModel:
+    selector_model = RandomForestClassifier(
+        n_estimators=300,
         random_state=RANDOM_STATE,
         n_jobs=-1,
+        class_weight="balanced_subsample",
+    )
+    return SelectFromModel(
+        estimator=selector_model,
+        threshold=-np.inf,
+        max_features=TOP_TREE_FEATURES,
     )
 
 
-def objective(trial, X_tr, y_tr, X_val, y_val):
-    svm_c = trial.suggest_float("svm_C", 0.1, 100.0, log=True)
-    svm_gamma = trial.suggest_float("svm_gamma", 1e-4, 1.0, log=True)
-    xgb_max_depth = trial.suggest_int("xgb_max_depth", 3, 10)
-    xgb_learning_rate = trial.suggest_float("xgb_learning_rate", 0.01, 0.3, log=True)
-
-    svm_base = SVC(
-        C=svm_c,
-        gamma=svm_gamma,
-        kernel="rbf",
-        decision_function_shape="ovr",
-        probability=False,
-        verbose=False,
-        random_state=RANDOM_STATE,
-    )
-    svm_model = Pipeline(
+def build_base_estimators(num_class: int):
+    svm_pipeline = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
             ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-            ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
-        ],
-        verbose=True,
+            (
+                "svm",
+                SVC(
+                    C=5.0,
+                    gamma=0.0005,
+                    kernel="rbf",
+                    decision_function_shape="ovr",
+                    probability=False,
+                    random_state=RANDOM_STATE,
+                    class_weight="balanced",
+                ),
+            ),
+        ]
     )
-    svm_model.fit(X_tr, y_tr)
-    svm_val_proba = svm_model.predict_proba(X_val)
 
-    xgb_pre = Pipeline(
+    rf = RandomForestClassifier(
+        n_estimators=600,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+    )
+
+    knn_pipeline = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
-        ],
-        verbose=True,
+            ("pca", PCA(n_components=120, random_state=RANDOM_STATE)),
+            ("knn", KNeighborsClassifier(n_neighbors=15, weights="distance", n_jobs=-1)),
+        ]
     )
-    X_tr_xgb = xgb_pre.fit_transform(X_tr)
-    X_val_xgb = xgb_pre.transform(X_val)
 
-    xgb_model = build_xgb(
-        num_class=len(np.unique(y_tr)),
-        max_depth=xgb_max_depth,
-        learning_rate=xgb_learning_rate,
-        n_estimators=220,
+    xgb_pipeline = Pipeline(
+        steps=[
+            ("selector", build_tree_selector()),
+            (
+                "boost",
+                EarlyStoppingBoostingClassifier(
+                    model_name="xgb",
+                    model_params={
+                        "n_estimators": 1200,
+                        "max_depth": 8,
+                        "learning_rate": 0.05,
+                        "subsample": 0.9,
+                        "colsample_bytree": 0.9,
+                        "objective": "multi:softprob",
+                        "num_class": num_class,
+                        "eval_metric": "mlogloss",
+                        "random_state": RANDOM_STATE,
+                        "n_jobs": -1,
+                        "tree_method": "hist",
+                        "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                    },
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
     )
-    # Convert to DMatrix for GPU
-    import xgboost as xgb
-    dtrain = xgb.DMatrix(X_tr_xgb, label=y_tr, enable_categorical=False, nthread=-1)
-    dval = xgb.DMatrix(X_val_xgb, label=y_val, enable_categorical=False, nthread=-1)
-    xgb_model.fit(X_tr_xgb, y_tr, eval_set=[(X_val_xgb, y_val)], verbose=False)
-    xgb_val_proba = xgb_model.predict_proba(X_val_xgb)
 
-    blended_val = 0.5 * svm_val_proba + 0.5 * xgb_val_proba
-    y_pred = np.argmax(blended_val, axis=1)
-    return accuracy_score(y_val, y_pred)
+    cat_pipeline = Pipeline(
+        steps=[
+            ("selector", build_tree_selector()),
+            (
+                "boost",
+                EarlyStoppingBoostingClassifier(
+                    model_name="cat",
+                    model_params={
+                        "iterations": 1200,
+                        "depth": 8,
+                        "learning_rate": 0.05,
+                        "loss_function": "MultiClass",
+                        "eval_metric": "MultiClass",
+                        "random_seed": RANDOM_STATE,
+                        "od_type": "Iter",
+                        "od_wait": EARLY_STOPPING_ROUNDS,
+                        "allow_writing_files": False,
+                    },
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    lgbm_pipeline = Pipeline(
+        steps=[
+            ("selector", build_tree_selector()),
+            (
+                "boost",
+                EarlyStoppingBoostingClassifier(
+                    model_name="lgbm",
+                    model_params={
+                        "n_estimators": 1200,
+                        "learning_rate": 0.05,
+                        "num_leaves": 63,
+                        "subsample": 0.9,
+                        "colsample_bytree": 0.9,
+                        "objective": "multiclass",
+                        "num_class": num_class,
+                        "random_state": RANDOM_STATE,
+                        "n_jobs": -1,
+                        "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                        "verbosity": -1,
+                    },
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    return {
+        "svm": CalibratedClassifierCV(svm_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+        "rf": CalibratedClassifierCV(rf, method="sigmoid", cv=3, n_jobs=-1),
+        "knn": CalibratedClassifierCV(knn_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+        "xgb": CalibratedClassifierCV(xgb_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+        "cat": CalibratedClassifierCV(cat_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+        "lgbm": CalibratedClassifierCV(lgbm_pipeline, method="sigmoid", cv=3, n_jobs=-1),
+    }
 
 
 def main():
     setup_logging()
-
     logging.info("Loading train/validation/test feature splits...")
-    X_tr, X_val, X_te, y_tr, y_val, y_te = load_or_build_features()
-    # Merge train and val for OOF stacking
+    X_tr, X_val, X_te, y_tr, y_val, y_te, test_names = load_or_build_features()
+
+    logging.info("Merging train and validation for OOF stacking...")
     X_train_full = np.vstack([X_tr, X_val])
     y_train_full = np.concatenate([y_tr, y_val])
     num_class = len(np.unique(y_train_full))
 
-    # Optuna: 20% subsample, 3-fold CV, 30 trials
-    from sklearn.model_selection import StratifiedKFold
-    def optuna_objective(trial):
-        svm_c = trial.suggest_float("svm_C", 0.1, 100.0, log=True)
-        svm_gamma = trial.suggest_float("svm_gamma", 1e-4, 1.0, log=True)
-        xgb_max_depth = trial.suggest_int("xgb_max_depth", 3, 10)
-        xgb_learning_rate = trial.suggest_float("xgb_learning_rate", 0.01, 0.3, log=True)
-        # Subsample
-        X_sub, _, y_sub, _ = train_test_split(
-            X_train_full, y_train_full, train_size=0.20, random_state=RANDOM_STATE, stratify=y_train_full
-        )
-        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
-        accs = []
-        for train_idx, val_idx in skf.split(X_sub, y_sub):
-            X_tr_o, X_val_o = X_sub[train_idx], X_sub[val_idx]
-            y_tr_o, y_val_o = y_sub[train_idx], y_sub[val_idx]
-            # SVM with class_weight
-            svm_base = SVC(
-                C=svm_c,
-                gamma=svm_gamma,
-                kernel="rbf",
-                decision_function_shape="ovr",
-                probability=False,
-                verbose=False,
-                random_state=RANDOM_STATE,
-                class_weight='balanced',
-            )
-            svm_model = Pipeline([
-                ("scaler", StandardScaler()),
-                ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-                ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
-            ])
-            svm_model.fit(X_tr_o, y_tr_o)
-            svm_val_proba = svm_model.predict_proba(X_val_o)
-            # XGB
-            xgb_pre = Pipeline([
-                ("scaler", StandardScaler()),
-                ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
-            ])
-            X_tr_xgb = xgb_pre.fit_transform(X_tr_o)
-            X_val_xgb = xgb_pre.transform(X_val_o)
-            xgb_model = build_xgb(
-                num_class=len(np.unique(y_tr_o)),
-                max_depth=xgb_max_depth,
-                learning_rate=xgb_learning_rate,
-                n_estimators=220,
-            )
-            xgb_model.fit(X_tr_xgb, y_tr_o, eval_set=[(X_val_xgb, y_val_o)], verbose=False)
-            xgb_val_proba = xgb_model.predict_proba(X_val_xgb)
-            # Blend
-            blended_val = 0.5 * svm_val_proba + 0.5 * xgb_val_proba
-            y_pred = np.argmax(blended_val, axis=1)
-            accs.append(accuracy_score(y_val_o, y_pred))
-        return np.mean(accs)
+    logging.info("Preparing flipped test features for TTA...")
+    X_te_flip = build_flipped_features(test_names)
 
-    logging.info("Starting Optuna hyperparameter search (%d trials, 3-fold CV, 20%% subsample)...", OPTUNA_TRIALS)
-    study = optuna.create_study(direction="maximize")
-    study.optimize(optuna_objective, n_trials=OPTUNA_TRIALS)
-    best_params = study.best_params
-    logging.info("Best Optuna params: %s", best_params)
-    logging.info("Best Optuna CV score: %.4f", study.best_value)
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    model_names = ["svm", "rf", "knn", "xgb", "cat", "lgbm"]
 
-    # OOF stacking
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    n_train = X_train_full.shape[0]
-    n_test = X_te.shape[0]
-    oof_svm = np.zeros((n_train, num_class))
-    oof_rf = np.zeros((n_train, num_class))
-    oof_knn = np.zeros((n_train, num_class))
-    oof_xgb = np.zeros((n_train, num_class))
-    oof_cat = np.zeros((n_train, num_class))
-    test_svm = np.zeros((n_test, num_class, 5))
-    test_rf = np.zeros((n_test, num_class, 5))
-    test_knn = np.zeros((n_test, num_class, 5))
-    test_xgb = np.zeros((n_test, num_class, 5))
-    test_cat = np.zeros((n_test, num_class, 5))
+    oof_preds = {
+        name: np.zeros((X_train_full.shape[0], num_class), dtype=np.float32)
+        for name in model_names
+    }
+    tta_test_preds = {
+        name: np.zeros((X_te.shape[0], num_class, N_SPLITS), dtype=np.float32)
+        for name in model_names
+    }
 
-    def tta_predict(model, X):
-        # Test-Time Augmentation: original and horizontal flip, average probs
-        X_flip = X.copy()
-        # For TTA, we need to flip the original images, so reload and extract features for flip
-        # This assumes X is in the same order as test.csv
-        test_df = pd.read_csv('test.csv')
-        X_flip_feats = []
-        for row in tqdm(test_df.itertuples(index=False), total=len(test_df), desc='TTA flip', file=sys.__stdout__):
-            img = cv2.imread(os.path.join('test_ims', row.im_name))
-            img_flip = cv2.flip(img, 1)
-            X_flip_feats.append(extract_features(img_flip))
-        X_flip_feats = np.vstack(X_flip_feats)
-        proba_orig = model.predict_proba(X)
-        proba_flip = model.predict_proba(X_flip_feats)
-        return (proba_orig + proba_flip) / 2
+    for fold_idx, (train_idx, valid_idx) in enumerate(skf.split(X_train_full, y_train_full), start=1):
+        logging.info("Starting OOF fold %d/%d", fold_idx, N_SPLITS)
+        fold_start_time = time.time()
+        X_fold_train, X_fold_valid = X_train_full[train_idx], X_train_full[valid_idx]
+        y_fold_train, y_fold_valid = y_train_full[train_idx], y_train_full[valid_idx]
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_full, y_train_full)):
-        logging.info(f"OOF fold {fold+1}/5...")
-        X_tr_o, X_val_o = X_train_full[train_idx], X_train_full[val_idx]
-        y_tr_o, y_val_o = y_train_full[train_idx], y_train_full[val_idx]
-        # SVM with class_weight
-        svm_base = SVC(
-            C=best_params["svm_C"],
-            gamma=best_params["svm_gamma"],
-            kernel="rbf",
-            decision_function_shape="ovr",
-            probability=False,
-            verbose=False,
-            random_state=RANDOM_STATE,
-            class_weight='balanced',
-        )
-        svm = Pipeline([
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-            ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
-        ])
-        svm.fit(X_tr_o, y_tr_o)
-        oof_svm[val_idx] = svm.predict_proba(X_val_o)
-        test_svm[:, :, fold] = tta_predict(svm, X_te)
-        # RF with class_weight
-        rf = RandomForestClassifier(
-            n_estimators=500,
-            max_depth=None,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            verbose=0,
-            class_weight='balanced',
-        )
-        rf.fit(X_tr_o, y_tr_o)
-        oof_rf[val_idx] = rf.predict_proba(X_val_o)
-        test_rf[:, :, fold] = tta_predict(rf, X_te)
-        # KNN
-        knn = Pipeline([
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=50, random_state=RANDOM_STATE)),
-            ("knn", KNeighborsClassifier(n_neighbors=15, n_jobs=-1)),
-        ])
-        knn.fit(X_tr_o, y_tr_o)
-        oof_knn[val_idx] = knn.predict_proba(X_val_o)
-        test_knn[:, :, fold] = tta_predict(knn, X_te)
-        # XGB
-        xgb_pre = Pipeline([
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
-        ])
-        X_tr_xgb = xgb_pre.fit_transform(X_tr_o)
-        X_val_xgb = xgb_pre.transform(X_val_o)
-        X_te_xgb = xgb_pre.transform(X_te)
-        xgb = build_xgb(
-            num_class=num_class,
-            max_depth=best_params["xgb_max_depth"],
-            learning_rate=best_params["xgb_learning_rate"],
-            n_estimators=520,
-        )
-        xgb.fit(X_tr_xgb, y_tr_o, eval_set=[(X_val_xgb, y_val_o)], verbose=0)
-        oof_xgb[val_idx] = xgb.predict_proba(X_val_xgb)
-        # TTA for XGB: average original and flip
-        # For boosting models, use the same TTA as above
-        test_xgb[:, :, fold] = tta_predict(xgb, X_te_xgb)
-        # CatBoost
-        catboost = CatBoostClassifier(
-            iterations=600,
-            depth=8,
-            learning_rate=0.05,
-            loss_function="MultiClass",
-            eval_metric="MultiClass",
-            random_seed=RANDOM_STATE,
-            task_type="GPU",
-            verbose=0,
-        )
-        catboost.fit(X_tr_o, y_tr_o, eval_set=(X_val_o, y_val_o))
-        oof_cat[val_idx] = catboost.predict_proba(X_val_o)
-        # TTA for CatBoost
-        test_cat[:, :, fold] = tta_predict(catboost, X_te)
+        estimators = build_base_estimators(num_class=num_class)
 
-    # Average test meta-features across folds
-    test_svm_mean = np.mean(test_svm, axis=2)
-    test_rf_mean = np.mean(test_rf, axis=2)
-    test_knn_mean = np.mean(test_knn, axis=2)
-    test_xgb_mean = np.mean(test_xgb, axis=2)
-    test_cat_mean = np.mean(test_cat, axis=2)
+        for name in model_names:
+            logging.info("Fold %d | Training calibrated %s", fold_idx, name.upper())
+            model = estimators[name]
+            model.fit(X_fold_train, y_fold_train)
 
-    # Train meta-learner
-    X_meta_train = np.hstack([oof_svm, oof_xgb, oof_rf, oof_cat, oof_knn])
-    X_meta_test = np.hstack([test_svm_mean, test_xgb_mean, test_rf_mean, test_cat_mean, test_knn_mean])
-    meta_learner = LogisticRegression(max_iter=3000, random_state=RANDOM_STATE)
+            valid_proba = model.predict_proba(X_fold_valid)
+            oof_preds[name][valid_idx] = valid_proba
+
+            test_proba_orig = model.predict_proba(X_te)
+            test_proba_flip = model.predict_proba(X_te_flip)
+            tta_test_preds[name][:, :, fold_idx - 1] = (test_proba_orig + test_proba_flip) / 2.0
+
+            fold_acc = accuracy_score(y_fold_valid, np.argmax(valid_proba, axis=1))
+            logging.info("Fold %d | %s validation accuracy: %.4f", fold_idx, name.upper(), fold_acc)
+
+        fold_elapsed = time.time() - fold_start_time
+        print(f"Fold {fold_idx}/{N_SPLITS} elapsed time: {fold_elapsed:.2f} seconds")
+
+    logging.info("Training LogisticRegression meta-learner on OOF probabilities...")
+    X_meta_train = np.hstack([oof_preds[name] for name in model_names])
+    X_meta_test = np.hstack([
+        np.mean(tta_test_preds[name], axis=2) for name in model_names
+    ])
+
+    meta_learner = LogisticRegression(
+        max_iter=4000,
+        random_state=RANDOM_STATE,
+        multi_class="auto",
+    )
     meta_learner.fit(X_meta_train, y_train_full)
 
-    # Refit all base models on full train
-    logging.info("Refitting all base models on full training set...")
-    # SVM
-    svm_base = SVC(
-        C=best_params["svm_C"],
-        gamma=best_params["svm_gamma"],
-        kernel="rbf",
-        decision_function_shape="ovr",
-        probability=False,
-        verbose=2,
-        random_state=RANDOM_STATE,
-    )
-    svm = Pipeline([
-        ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=0.95, random_state=RANDOM_STATE)),
-        ("cal", CalibratedClassifierCV(svm_base, method="sigmoid", cv=3, n_jobs=-1)),
-    ])
-    svm.fit(X_train_full, y_train_full)
-    # RF
-    rf = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=2,
-    )
-    rf.fit(X_train_full, y_train_full)
-    # KNN
-    knn = Pipeline([
-        ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=50, random_state=RANDOM_STATE)),
-        ("knn", KNeighborsClassifier(n_neighbors=15, n_jobs=-1)),
-    ])
-    knn.fit(X_train_full, y_train_full)
-    # XGB
-    xgb_pre = Pipeline([
-        ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=320, random_state=RANDOM_STATE)),
-    ])
-    X_train_xgb = xgb_pre.fit_transform(X_train_full)
-    X_te_xgb = xgb_pre.transform(X_te)
-    xgb = build_xgb(
-        num_class=num_class,
-        max_depth=best_params["xgb_max_depth"],
-        learning_rate=best_params["xgb_learning_rate"],
-        n_estimators=520,
-    )
-    xgb.fit(X_train_xgb, y_train_full, verbose=10)
-    # CatBoost
-    catboost = CatBoostClassifier(
-        iterations=600,
-        depth=8,
-        learning_rate=0.05,
-        loss_function="MultiClass",
-        eval_metric="MultiClass",
-        random_seed=RANDOM_STATE,
-        task_type="GPU",
-        verbose=10,
-    )
-    catboost.fit(X_train_full, y_train_full)
-
-    # Final test prediction
     y_pred = meta_learner.predict(X_meta_test)
     acc = accuracy_score(y_te, y_pred)
-    logging.info("=" * 60)
-    logging.info("Stacked ensemble test accuracy: %.4f", acc)
-    logging.info("=" * 60)
-    logging.info("\n%s", classification_report(y_te, y_pred))
 
-    dump(
-        {
-            "svm": svm,
-            "xgb_pre": xgb_pre,
-            "xgb": xgb,
-            "rf": rf,
-            "knn": knn,
-            "catboost": catboost,
-            "meta_learner": meta_learner,
-            "optuna_best_params": best_params,
-            "final_acc": acc,
-        },
-        "classical_strong_ensemble.joblib",
-    )
-    logging.info("Saved model bundle: classical_strong_ensemble.joblib")
+    logging.info("=" * 60)
+    logging.info("5-Fold OOF stacked ensemble test accuracy: %.4f", acc)
+    logging.info("=" * 60)
+    logging.info("\n%s", classification_report(y_te, y_pred, digits=4))
+
+    bundle = {
+        "model_type": "5fold_oof_stacking_v2",
+        "feature_spec": "hog+lbp+color_hist+gabor+raw16x16",
+        "base_model_order": model_names,
+        "meta_learner": meta_learner,
+        "oof_meta_train": X_meta_train,
+        "test_meta_features": X_meta_test,
+        "test_true_labels": y_te,
+        "test_pred_labels": y_pred,
+        "final_accuracy": acc,
+        "classification_report": classification_report(y_te, y_pred, digits=4),
+        "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+        "tree_feature_top_k": TOP_TREE_FEATURES,
+    }
+    dump(bundle, "stacked_ensemble_v2.joblib")
+    logging.info("Saved model bundle: stacked_ensemble_v2.joblib")
 
 
 if __name__ == "__main__":
