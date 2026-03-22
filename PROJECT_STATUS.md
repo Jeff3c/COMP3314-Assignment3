@@ -19,9 +19,17 @@ Last updated: 2026-03-21
 - VotingClassifier double-fit path removed.
 
 ## Current Risks / Notes
-- Full training can be time-consuming, especially SVM calibration.
-- GPU path for XGBoost depends on local CUDA support.
-- Data files are intentionally excluded from Git and must be downloaded separately.
+- Full training is still compute-intensive, but Optuna tuning is now much faster due to subsampling.
+- All results and progress can be monitored in training_log.txt.
+- Final model is saved as classical_strong_ensemble.joblib and includes all base models and the meta-learner.
+
+## March 2026 Major Pipeline Update
+- Pipeline now uses a 5-base-model ensemble (SVM, XGBoost, RandomForest, CatBoost, KNN) with LogisticRegression meta-learner.
+- Optuna hyperparameter tuning (15 trials, 15% subsample) for SVM and XGBoost.
+- Feature extraction now includes Gabor filter features (mean/std for 4 orientations).
+- tqdm progress bars for all feature extraction.
+- All logs and progress are saved to training_log.txt for remote monitoring.
+- No neural networks are used (classical ML only).
 
 ## Next Suggested Tasks
 1. Run final full training without interruption and record metrics.

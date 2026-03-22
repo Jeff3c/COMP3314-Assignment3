@@ -28,3 +28,7 @@ Use clear commit messages:
 - Reproducibility and deterministic splits.
 - Runtime cost and memory usage.
 - Correctness of test-time prediction logic.
+
+## Documentation
+- When updating the pipeline (e.g., new ensemble, meta-learner, Optuna tuning, logging, or feature extraction changes), update README.md and PROJECT_STATUS.md to reflect the new workflow and requirements.
+- Summarize major changes for teammates in the Major Pipeline Updates section of README.md.
