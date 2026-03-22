@@ -25,7 +25,7 @@ from catboost import CatBoostClassifier
 TRAIN_CSV = "train.csv"
 TRAIN_DIR = "train_ims"
 LOG_FILE = "training_log.txt"
-OPTUNA_TRIALS = 15  # Reduce from 50 to 15 to save days of compute time
+OPTUNA_TRIALS = 30  # Increased for more robust search
 RANDOM_STATE = 42
 
 
@@ -276,7 +276,7 @@ def main():
     y_train_full = np.concatenate([y_tr, y_val])
     num_class = len(np.unique(y_train_full))
 
-    # Optuna: 15% subsample, 3-fold CV
+    # Optuna: 20% subsample, 3-fold CV, 30 trials
     from sklearn.model_selection import StratifiedKFold
     def optuna_objective(trial):
         svm_c = trial.suggest_float("svm_C", 0.1, 100.0, log=True)
@@ -285,14 +285,14 @@ def main():
         xgb_learning_rate = trial.suggest_float("xgb_learning_rate", 0.01, 0.3, log=True)
         # Subsample
         X_sub, _, y_sub, _ = train_test_split(
-            X_train_full, y_train_full, train_size=0.15, random_state=RANDOM_STATE, stratify=y_train_full
+            X_train_full, y_train_full, train_size=0.20, random_state=RANDOM_STATE, stratify=y_train_full
         )
         skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
         accs = []
         for train_idx, val_idx in skf.split(X_sub, y_sub):
             X_tr_o, X_val_o = X_sub[train_idx], X_sub[val_idx]
             y_tr_o, y_val_o = y_sub[train_idx], y_sub[val_idx]
-            # SVM
+            # SVM with class_weight
             svm_base = SVC(
                 C=svm_c,
                 gamma=svm_gamma,
@@ -301,6 +301,7 @@ def main():
                 probability=False,
                 verbose=False,
                 random_state=RANDOM_STATE,
+                class_weight='balanced',
             )
             svm_model = Pipeline([
                 ("scaler", StandardScaler()),
@@ -330,7 +331,7 @@ def main():
             accs.append(accuracy_score(y_val_o, y_pred))
         return np.mean(accs)
 
-    logging.info("Starting Optuna hyperparameter search (%d trials, 3-fold CV, 15%% subsample)...", OPTUNA_TRIALS)
+    logging.info("Starting Optuna hyperparameter search (%d trials, 3-fold CV, 20%% subsample)...", OPTUNA_TRIALS)
     study = optuna.create_study(direction="maximize")
     study.optimize(optuna_objective, n_trials=OPTUNA_TRIALS)
     best_params = study.best_params
@@ -341,24 +342,38 @@ def main():
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     n_train = X_train_full.shape[0]
     n_test = X_te.shape[0]
-    # Pre-allocate OOF and test meta-features
     oof_svm = np.zeros((n_train, num_class))
     oof_rf = np.zeros((n_train, num_class))
     oof_knn = np.zeros((n_train, num_class))
     oof_xgb = np.zeros((n_train, num_class))
     oof_cat = np.zeros((n_train, num_class))
-    # For test set, average predictions from each fold
     test_svm = np.zeros((n_test, num_class, 5))
     test_rf = np.zeros((n_test, num_class, 5))
     test_knn = np.zeros((n_test, num_class, 5))
     test_xgb = np.zeros((n_test, num_class, 5))
     test_cat = np.zeros((n_test, num_class, 5))
 
+    def tta_predict(model, X):
+        # Test-Time Augmentation: original and horizontal flip, average probs
+        X_flip = X.copy()
+        # For TTA, we need to flip the original images, so reload and extract features for flip
+        # This assumes X is in the same order as test.csv
+        test_df = pd.read_csv('test.csv')
+        X_flip_feats = []
+        for row in tqdm(test_df.itertuples(index=False), total=len(test_df), desc='TTA flip', file=sys.__stdout__):
+            img = cv2.imread(os.path.join('test_ims', row.im_name))
+            img_flip = cv2.flip(img, 1)
+            X_flip_feats.append(extract_features(img_flip))
+        X_flip_feats = np.vstack(X_flip_feats)
+        proba_orig = model.predict_proba(X)
+        proba_flip = model.predict_proba(X_flip_feats)
+        return (proba_orig + proba_flip) / 2
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_full, y_train_full)):
         logging.info(f"OOF fold {fold+1}/5...")
         X_tr_o, X_val_o = X_train_full[train_idx], X_train_full[val_idx]
         y_tr_o, y_val_o = y_train_full[train_idx], y_train_full[val_idx]
-        # SVM
+        # SVM with class_weight
         svm_base = SVC(
             C=best_params["svm_C"],
             gamma=best_params["svm_gamma"],
@@ -367,6 +382,7 @@ def main():
             probability=False,
             verbose=False,
             random_state=RANDOM_STATE,
+            class_weight='balanced',
         )
         svm = Pipeline([
             ("scaler", StandardScaler()),
@@ -375,8 +391,8 @@ def main():
         ])
         svm.fit(X_tr_o, y_tr_o)
         oof_svm[val_idx] = svm.predict_proba(X_val_o)
-        test_svm[:, :, fold] = svm.predict_proba(X_te)
-        # RF
+        test_svm[:, :, fold] = tta_predict(svm, X_te)
+        # RF with class_weight
         rf = RandomForestClassifier(
             n_estimators=500,
             max_depth=None,
@@ -385,10 +401,11 @@ def main():
             random_state=RANDOM_STATE,
             n_jobs=-1,
             verbose=0,
+            class_weight='balanced',
         )
         rf.fit(X_tr_o, y_tr_o)
         oof_rf[val_idx] = rf.predict_proba(X_val_o)
-        test_rf[:, :, fold] = rf.predict_proba(X_te)
+        test_rf[:, :, fold] = tta_predict(rf, X_te)
         # KNN
         knn = Pipeline([
             ("scaler", StandardScaler()),
@@ -397,7 +414,7 @@ def main():
         ])
         knn.fit(X_tr_o, y_tr_o)
         oof_knn[val_idx] = knn.predict_proba(X_val_o)
-        test_knn[:, :, fold] = knn.predict_proba(X_te)
+        test_knn[:, :, fold] = tta_predict(knn, X_te)
         # XGB
         xgb_pre = Pipeline([
             ("scaler", StandardScaler()),
@@ -414,7 +431,9 @@ def main():
         )
         xgb.fit(X_tr_xgb, y_tr_o, eval_set=[(X_val_xgb, y_val_o)], verbose=0)
         oof_xgb[val_idx] = xgb.predict_proba(X_val_xgb)
-        test_xgb[:, :, fold] = xgb.predict_proba(X_te_xgb)
+        # TTA for XGB: average original and flip
+        # For boosting models, use the same TTA as above
+        test_xgb[:, :, fold] = tta_predict(xgb, X_te_xgb)
         # CatBoost
         catboost = CatBoostClassifier(
             iterations=600,
@@ -428,7 +447,8 @@ def main():
         )
         catboost.fit(X_tr_o, y_tr_o, eval_set=(X_val_o, y_val_o))
         oof_cat[val_idx] = catboost.predict_proba(X_val_o)
-        test_cat[:, :, fold] = catboost.predict_proba(X_te)
+        # TTA for CatBoost
+        test_cat[:, :, fold] = tta_predict(catboost, X_te)
 
     # Average test meta-features across folds
     test_svm_mean = np.mean(test_svm, axis=2)

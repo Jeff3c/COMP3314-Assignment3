@@ -53,19 +53,21 @@ Typical outputs are generated locally and ignored by Git:
 
 ## Major Pipeline Updates (March 2026)
 
-- **OOF Ensemble Stacking**: The main pipeline now uses Out-Of-Fold (OOF) stacking with 5-fold StratifiedKFold. Five base models (SVM, XGBoost, RandomForest, CatBoost, KNN) generate OOF meta-features for a LogisticRegression meta-learner. All base models are refit on the full training set before test prediction.
-- **Optuna Hyperparameter Tuning**: SVM and XGBoost hyperparameters are tuned using Optuna (15 trials, 15% subsample of training data, 3-fold CV for speed and robustness). Final models are trained on the full training set.
-- **Feature Extraction**: In addition to HOG, LBP, HSV histograms, and downsampled grayscale, the pipeline now includes Gabor filter features (mean and std for 4 orientations).
+- **Professional OOF Ensemble Stacking**: The main pipeline uses Out-Of-Fold (OOF) stacking with 5-fold StratifiedKFold. Five base models (SVM, XGBoost, RandomForest, CatBoost, KNN) generate OOF meta-features for a LogisticRegression meta-learner. All base models are refit on the full training set before test prediction. SVM and RandomForest use class_weight='balanced' to improve F1-score for weaker classes.
+- **Test-Time Augmentation (TTA)**: For each test image, predictions are averaged between the original and a horizontal flip to improve robustness.
+- **Optuna Hyperparameter Tuning**: SVM and XGBoost hyperparameters are tuned using Optuna (30 trials, 20% subsample of training data, 3-fold CV for speed and robustness). Final models are trained on the full training set.
+- **Feature Extraction**: In addition to HOG, LBP, HSV histograms, and downsampled grayscale, the pipeline includes Gabor filter features (mean and std for 4 orientations).
 - **Progress and Logging**: All feature extraction uses tqdm progress bars. All terminal/logging output is saved to `training_log.txt` for remote monitoring.
 - **No Neural Networks**: All models are classical ML (no deep learning).
 
 ## How the Pipeline Works
 1. **Feature Extraction**: HOG, LBP, HSV, Gabor, and downsampled grayscale features are extracted for each image.
 2. **Safe Splitting**: Data is split into train/val/test before any augmentation. Only the train split is augmented (horizontal flip).
-3. **Optuna Tuning**: SVM (C, gamma) and XGBoost (max_depth, learning_rate) are tuned on a 15% subsample of the merged training set using 3-fold cross-validation for 15 trials.
-4. **OOF Stacking**: Five base models are trained using 5-fold StratifiedKFold. Their out-of-fold (OOF) probability predictions are stacked to train a LogisticRegression meta-learner. All base models are then refit on the full training set before test prediction.
-5. **Test Prediction**: The meta-learner predicts final test classes using stacked base model probabilities from the refit base models.
-6. **Logging**: All progress and results are saved to `training_log.txt`.
+3. **Optuna Tuning**: SVM (C, gamma, class_weight='balanced') and XGBoost (max_depth, learning_rate) are tuned on a 20% subsample of the merged training set using 3-fold cross-validation for 30 trials.
+4. **OOF Stacking**: Five base models (SVM, XGBoost, RandomForest, CatBoost, KNN) are trained using 5-fold StratifiedKFold. Their out-of-fold (OOF) probability predictions are stacked to train a LogisticRegression meta-learner. All base models are then refit on the full training set before test prediction. SVM and RandomForest use class_weight='balanced'.
+5. **Test-Time Augmentation (TTA)**: For each test image, predictions are averaged between the original and a horizontal flip before final classification.
+6. **Test Prediction**: The meta-learner predicts final test classes using stacked base model probabilities from the refit base models.
+7. **Logging**: All progress and results are saved to `training_log.txt`.
 
 ## To Run the Full Pipeline
 1. Ensure all dependencies in `requirements.txt` are installed (see below).
