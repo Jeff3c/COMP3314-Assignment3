@@ -28,6 +28,7 @@ from tqdm import tqdm
 from xgboost import XGBClassifier
 
 
+
 TRAIN_CSV = "train.csv"
 TRAIN_DIR = "train_ims"
 LOG_FILE = "training_log.txt"
@@ -35,6 +36,9 @@ RANDOM_STATE = 42
 N_SPLITS = 5
 EARLY_STOPPING_ROUNDS = 50
 TOP_TREE_FEATURES = 1000
+
+# If True, delete all .npy feature caches before loading/building features
+CLEAR_CACHE = False
 
 
 class TeeStream:
@@ -53,8 +57,10 @@ class TeeStream:
             stream.flush()
 
 
+
 class EarlyStoppingBoostingClassifier(BaseEstimator, ClassifierMixin):
     """Fit boosting models with an internal validation split for early stopping."""
+    _estimator_type = "classifier"
 
     def __init__(self, model_name: str, model_params: dict, random_state: int = RANDOM_STATE):
         self.model_name = model_name
@@ -116,6 +122,7 @@ class EarlyStoppingBoostingClassifier(BaseEstimator, ClassifierMixin):
         
         elapsed = time.time() - start_time
         print(f"  >>> {self.model_name.upper()} training took {elapsed:.2f} seconds.")
+        gc.collect()  # Free X_fit/X_eval memory immediately
         return self
 
     def predict(self, X):
@@ -258,6 +265,17 @@ def load_or_build_features():
     cache_test_y = "y_test_safe_gabor_v2.npy"
     cache_test_names = "test_split_names_safe_gabor_v2.npy"
 
+
+    # Invalidate cache if CLEAR_CACHE is set
+    if CLEAR_CACHE:
+        for f in [cache_train, cache_train_y, cache_val, cache_val_y, cache_test, cache_test_y, cache_test_names]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                    logging.info(f"Deleted cache file: {f}")
+                except Exception as e:
+                    logging.warning(f"Could not delete cache file {f}: {e}")
+
     has_main_caches = all(
         os.path.exists(f)
         for f in [cache_train, cache_train_y, cache_val, cache_val_y, cache_test, cache_test_y]
@@ -334,9 +352,10 @@ def load_or_build_features():
 
 def build_tree_selector() -> SelectFromModel:
     selector_model = RandomForestClassifier(
-        n_estimators=300,
+        n_estimators=50,           # Reduced for speed/memory
+        max_depth=10,              # Shallower trees for less RAM
         random_state=RANDOM_STATE,
-        n_jobs=-1,
+        n_jobs=2,                  # Respect CPU limits
         class_weight="balanced_subsample",
     )
     return SelectFromModel(
@@ -367,13 +386,19 @@ def build_base_estimators(num_class: int):
         ]
     )
 
-    # 1. Constrain the Random Forest
-    rf = RandomForestClassifier(
-        n_estimators=400,          # Reduced from 600
-        max_depth=20,              # Limit tree depth to save massive RAM
-        random_state=RANDOM_STATE,
-        n_jobs=2,                  # Only use 2 cores internally, not all of them
-        class_weight="balanced_subsample",
+
+    # 1. Constrain the Random Forest and wrap in a pipeline with feature selector
+    rf_pipeline = Pipeline(
+        steps=[
+            ("selector", build_tree_selector()),
+            ("rf", RandomForestClassifier(
+                n_estimators=400,          # Reduced from 600
+                max_depth=20,              # Limit tree depth to save massive RAM
+                random_state=RANDOM_STATE,
+                n_jobs=2,                  # Only use 2 cores internally, not all of them
+                class_weight="balanced_subsample",
+            )),
+        ]
     )
 
     # ... (Keep KNN, XGB, CAT, LGBM pipelines exactly as they are) ...
@@ -466,8 +491,10 @@ def build_base_estimators(num_class: int):
     # Set n_jobs=1 or n_jobs=2 max for the wrappers.
     return {
         "svm": CalibratedClassifierCV(svm_pipeline, method="sigmoid", cv=3, n_jobs=2),
-        "rf": CalibratedClassifierCV(rf, method="sigmoid", cv=3, n_jobs=1),
+        # RF now uses a pipeline with selector for memory efficiency
+        "rf": CalibratedClassifierCV(rf_pipeline, method="sigmoid", cv=3, n_jobs=1),
         "knn": CalibratedClassifierCV(knn_pipeline, method="sigmoid", cv=3, n_jobs=1),
+        # These wrappers must be n_jobs=1 for RAM safety
         "xgb": CalibratedClassifierCV(xgb_pipeline, method="sigmoid", cv=3, n_jobs=1),
         "cat": CalibratedClassifierCV(cat_pipeline, method="sigmoid", cv=3, n_jobs=1),
         "lgbm": CalibratedClassifierCV(lgbm_pipeline, method="sigmoid", cv=3, n_jobs=1),
@@ -485,6 +512,7 @@ def main():
     num_class = len(np.unique(y_train_full))
 
     logging.info("Preparing flipped test features for TTA...")
+
     X_te_flip = build_flipped_features(test_names)
 
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
@@ -499,6 +527,7 @@ def main():
         for name in model_names
     }
 
+
     for fold_idx, (train_idx, valid_idx) in enumerate(skf.split(X_train_full, y_train_full), start=1):
         logging.info("Starting OOF fold %d/%d", fold_idx, N_SPLITS)
         fold_start_time = time.time()
@@ -506,7 +535,6 @@ def main():
         y_fold_train, y_fold_valid = y_train_full[train_idx], y_train_full[valid_idx]
 
         estimators = build_base_estimators(num_class=num_class)
-
 
         for name in model_names:
             logging.info("Fold %d | Training calibrated %s", fold_idx, name.upper())
@@ -529,21 +557,26 @@ def main():
         fold_elapsed = time.time() - fold_start_time
         print(f"Fold {fold_idx}/{N_SPLITS} elapsed time: {fold_elapsed:.2f} seconds")
 
+    # After TTA, clear X_te_flip to free memory
+    del X_te_flip
+    gc.collect()
+
+
     logging.info("Training LogisticRegression meta-learner on OOF probabilities...")
     X_meta_train = np.hstack([oof_preds[name] for name in model_names])
     X_meta_test = np.hstack([
         np.mean(tta_test_preds[name], axis=2) for name in model_names
     ])
+    gc.collect()  # Free up memory before meta-learner
 
-
-    # Regularized meta-learner to prevent overfitting
+    # Updated meta-learner: multinomial, lbfgs, l2
     meta_learner = LogisticRegression(
-        penalty='l1',
-        solver='liblinear',
+        penalty='l2',
+        solver='lbfgs',
         C=1.0,
         max_iter=4000,
         random_state=RANDOM_STATE,
-        multi_class="auto",
+        multi_class='multinomial',
     )
     meta_learner.fit(X_meta_train, y_train_full)
 

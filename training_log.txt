@@ -1,14 +1,21 @@
-2026-03-22 18:07:32,592 | INFO | Logging initialized. Writing terminal output to training_log.txt
-2026-03-22 18:07:32,593 | INFO | Loading train/validation/test feature splits...
-2026-03-22 18:07:34,216 | INFO | Loaded cached safe splits: X_tr=(70000, 2956), X_val=(5000, 2956), X_te=(10000, 2956)
-2026-03-22 18:07:34,216 | INFO | Merging train and validation for OOF stacking...
-2026-03-22 18:07:34,549 | INFO | Preparing flipped test features for TTA...
-2026-03-22 18:08:04,542 | INFO | Starting OOF fold 1/5
-2026-03-22 18:08:04,940 | INFO | Fold 1 | Training calibrated SVM
+2026-03-22 18:26:34,656 | INFO | Logging initialized. Writing terminal output to training_log.txt
+2026-03-22 18:26:34,657 | INFO | Loading train/validation/test feature splits...
+2026-03-22 18:26:35,760 | INFO | Loaded cached safe splits: X_tr=(70000, 2956), X_val=(5000, 2956), X_te=(10000, 2956)
+2026-03-22 18:26:35,761 | INFO | Merging train and validation for OOF stacking...
+2026-03-22 18:26:36,060 | INFO | Preparing flipped test features for TTA...
+2026-03-22 18:27:08,011 | INFO | Starting OOF fold 1/5
+2026-03-22 18:27:08,304 | INFO | Fold 1 | Training calibrated SVM
+2026-03-22 20:24:03,604 | INFO | Fold 1 | SVM validation accuracy: 0.7170
+2026-03-22 20:24:03,902 | INFO | Fold 1 | Training calibrated RF
+2026-03-22 20:39:33,479 | INFO | Fold 1 | RF validation accuracy: 0.5817
+2026-03-22 20:39:33,551 | INFO | Fold 1 | Training calibrated KNN
+2026-03-22 20:40:12,310 | INFO | Fold 1 | KNN validation accuracy: 0.6477
+2026-03-22 20:40:12,385 | INFO | Fold 1 | Training calibrated XGB
+  >>> XGB training took 3468.23 seconds.
 Traceback (most recent call last):
-  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 570, in <module>
+  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 577, in <module>
     main()
-  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 512, in main
+  File "C:\Users\USER\Downloads\COMP3314A3\train_classical_strong.py", line 514, in main
     model.fit(X_fold_train, y_fold_train)
   File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\base.py", line 1336, in wrapper
     return fit_method(estimator, *args, **kwargs)
@@ -19,11 +26,18 @@ Traceback (most recent call last):
   File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\utils\parallel.py", line 91, in __call__
     return super().__call__(iterable_with_config_and_warning_filters)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 2072, in __call__
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1986, in __call__
     return output if self.return_generator else list(output)
                                                 ^^^^^^^^^^^^
-  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1682, in _get_outputs
-    yield from self._retrieve()
-  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1800, in _retrieve
-    time.sleep(0.01)
-KeyboardInterrupt
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\joblib\parallel.py", line 1914, in _get_sequential_output
+    res = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\utils\parallel.py", line 184, in __call__
+    return self.function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\calibration.py", line 658, in _fit_classifier_calibrator_pair
+    predictions, _ = _get_response_values(
+                     ^^^^^^^^^^^^^^^^^^^^^
+  File "c:\Users\USER\Downloads\COMP3314A3\.venv\Lib\site-packages\sklearn\utils\_response.py", line 235, in _get_response_values
+    raise ValueError(
+ValueError: Pipeline should either be a classifier to be used with response_method=['decision_function', 'predict_proba'] or the response_method should be 'predict'. Got a regressor with response_method=['decision_function', 'predict_proba'] instead.
